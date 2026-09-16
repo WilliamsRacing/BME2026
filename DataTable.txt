@@ -1,0 +1,6 @@
+t_zsstnnrj_sensororiginaldata_system,uniqueid,healthid,groupid,externalid,sensorData,timeStamp.startTime,timeStamp.endTime
+t_zsstnnrj_mealinfo_puadqog7,externalid,dietaryType,beforeTime,afterTime,drinkingVolume,satiety,foodName,tablewareType,dietaryHand,wearHand
+t_zsstnnrj_zkkcxspk_copy,uniqueid,healthid,groupid,uploadtime,recordtime,timeStamp,deviceType,sensorData,sensorType,externalid,recordschema
+t_zsstnnrj_ri8meptd_copy,uniqueid,healthid,uploadtime,recordtime,externalid,dietaryType,timeFrame,beforeTime,afterTime,drinkingVolume,satiety,foodName,tablewareType,dietaryHand,wearHand,diningPictures
+t_zsstnnrj_rucjj6e1_copy,uniqueid,healthid,uploadtime,recordtime,externalid,height,weight,age,gender,wear,wrist,airbag
+t_zsstnnrj_singlesport_yva1dtns,uniqueid,healthid,uploadtime,recordtime,externalid,startTime,endTime,type
