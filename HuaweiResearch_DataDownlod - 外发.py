@@ -2,8 +2,10 @@ import csv
 import datetime
 import importlib
 import os
+import re
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import psutil
 import requests
@@ -29,15 +31,68 @@ class _DirectDownloadPool:
         self.session.trust_env = False
 
     def request(self, method, url, **kwargs):
-        response = self.session.request(method, url, timeout=(30, 300))
-        response.raise_for_status()
-        return _RequestsDownloadResponse(response)
+        try:
+            with self.session.request(method, url, timeout=(30, 300)) as response:
+                response.raise_for_status()
+                return _RequestsDownloadResponse(response)
+        finally:
+            self.session.close()
 
 
 # The old SDK uses a bare urllib3 pool for signed attachment URLs. Replace only
 # that pool; table queries and request signing still use the original SDK code.
 _sdk_service = importlib.import_module("huaweiresearchsdk.service.HiResearchDataService")
-_sdk_service.urllib3.PoolManager = _DirectDownloadPool
+# Do not replace PoolManager on the shared urllib3 module used by other code.
+_sdk_service.urllib3 = SimpleNamespace(PoolManager=_DirectDownloadPool)
+
+
+class AttachmentDownloadRequest(BatchGetFileRequest):
+    """Adapt SDK 1.0.0's string list to the server's DownLoadListReq list.
+
+    Each object carries the attachment key, source table and source record ID.
+    Verified against the live portal and downloads/urls endpoint on 2026-09-16.
+    """
+
+    def __init__(self, filepaths, output_path, project_id, table_id, unique_id):
+        if not isinstance(table_id, str) or not table_id.strip():
+            raise ValueError('附件请求必须提供来源数据表 table_id')
+        if not isinstance(unique_id, str) or not unique_id.strip():
+            raise ValueError('附件请求必须提供来源记录 uniqueid')
+        super().__init__(filepaths, output_path, project_id)
+        self.table_id = table_id.strip()
+        self.unique_id = unique_id
+
+    def get_file_paths(self):
+        return [{'objectKey': path, 'tableId': self.table_id, 'uniqueId': self.unique_id}
+                for path in super().get_file_paths()]
+
+
+def is_permanent_download_error(error):
+    response = getattr(error, 'response', None)
+    if response is None:
+        return False
+    code = response.status_code
+    # This service can wrap a business-level 400 in an HTTP 500 response.
+    try:
+        body = response.json()
+        if isinstance(body, dict) and 'code' in body:
+            business_code = int(body['code'])
+            if 400 <= business_code < 500:
+                code = business_code
+    except (ValueError, TypeError):
+        pass
+    return 400 <= code < 500 and code not in (408, 429)
+
+
+def format_download_error(error):
+    response = getattr(error, 'response', None)
+    if response is None:
+        message = '{}: {}'.format(type(error).__name__, error)
+    else:
+        message = 'HTTP {} {}；服务器响应：{}'.format(
+            response.status_code, response.reason, response.text.strip()[:2000])
+    # Signed download URLs can occur in transport exceptions and response bodies.
+    return re.sub(r'https?://[^\s"<>]+', '<URL omitted>', message)
 
 
 def monitor_system():
@@ -134,14 +189,16 @@ class AccessSdk():
             # break
         return resultD
 
-    def downloadAudio_Sensoe(self, downloadPath, savePath):
+    def downloadAudio_Sensoe(self, downloadPath, savePath, table_id, unique_id):
         os.makedirs(savePath, exist_ok=True)
         fileName = os.path.basename(downloadPath)
         filePath = os.path.join(savePath, fileName)
         if os.path.isfile(filePath) and os.path.getsize(filePath) > 0:
             return fileName
 
-        request = BatchGetFileRequest(filepaths=[downloadPath], output_path=savePath, project_id=self.project_id)
+        request = AttachmentDownloadRequest(
+            filepaths=[downloadPath], output_path=savePath,
+            project_id=self.project_id, table_id=table_id, unique_id=unique_id)
         self.bridgeclient.get_bridgedata_provider().batch_download_file(request)
         if not os.path.isfile(filePath) or os.path.getsize(filePath) == 0:
             raise RuntimeError("附件接口返回后未生成有效文件: {}".format(fileName))
@@ -312,7 +369,7 @@ def major(table_id, columnsName, accessKey, secretKey, yourProjectName,file_name
     # timestamps=[]
 
     substrings=['_motion_','_apneameasuredata_','_ecg_','_ppg_','_acceleration_','_sensororiginaldata_']
-    contains_all = any(sub in table_id for sub in substrings)
+    contains_all = 'sensorData' in columnsName or any(sub in table_id for sub in substrings)
     if  contains_all:
         if not os.path.exists(table_id + '附件'+file_name):
             os.makedirs(table_id + '附件'+file_name)
@@ -368,6 +425,11 @@ def getData(access, moreNum, timestamps, table_id, columnsName,file_name):
 
 
 def get_attachments(access, moreNum, timestamps, table_id, columnsName,file_name):
+    # Attachment authorization requires the uniqueid from the SAME source row.
+    columnsName = list(columnsName)
+    if 'uniqueid' not in columnsName:
+        columnsName.append('uniqueid')
+    unique_id_index = columnsName.index('uniqueid')
     j = 0
     fail_time = list()
     fail_file = list()
@@ -404,13 +466,14 @@ def get_attachments(access, moreNum, timestamps, table_id, columnsName,file_name
                     j += 1
                     writer.writerow(row)
 
-        attachment_paths = []
+        attachment_records = []
         for line in resultData:
-            attachment_paths.extend(
-                str(value) for value in line if str(value).startswith('kitattachments/')
+            attachment_records.extend(
+                (str(value), line[unique_id_index]) for value in line
+                if str(value).startswith('kitattachments/')
             )
 
-        for kit in dict.fromkeys(attachment_paths):
+        for kit, unique_id in dict.fromkeys(attachment_records):
             target_path = os.path.join(save_path, os.path.basename(kit))
             if os.path.isfile(target_path) and os.path.getsize(target_path) > 0:
                 skipped += 1
@@ -419,7 +482,7 @@ def get_attachments(access, moreNum, timestamps, table_id, columnsName,file_name
             last_error = None
             for attempt in range(1, 4):
                 try:
-                    access.downloadAudio_Sensoe(kit, save_path)
+                    access.downloadAudio_Sensoe(kit, save_path, table_id, unique_id)
                     downloaded += 1
                     print('附件进度: 新下载 {}，已存在 {}，失败 {}'.format(
                         downloaded, skipped, len(fail_file)))
@@ -428,12 +491,14 @@ def get_attachments(access, moreNum, timestamps, table_id, columnsName,file_name
                 except Exception as error:
                     last_error = error
                     print('附件下载失败（第 {}/3 次）: {}: {}'.format(
-                        attempt, os.path.basename(kit), error))
+                        attempt, os.path.basename(kit), format_download_error(error)))
+                    if is_permanent_download_error(error):
+                        break
                     if attempt < 3:
                         time.sleep(2 * attempt)
 
             if last_error is not None:
-                fail_file.append([kit, type(last_error).__name__, str(last_error)])
+                fail_file.append([kit, type(last_error).__name__, format_download_error(last_error)])
         print(i + 1, start_time, '———', end_time, '下载数据:', len(resultData), '   累计下载:', j, '条')
         time.sleep(6)
     print('附件保存目录：', save_path)
